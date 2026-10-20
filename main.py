@@ -1,46 +1,110 @@
 import math
 import random
-import pygame
-from pathlib import Path
+from array import array
 from collections import deque
+from pathlib import Path
 
-# THE LAST EXPEDITION
-# Controls: WASD or arrow keys to move; R to restart after a game ends; ESC to quit.
+import pygame
+
 
 pygame.init()
 
-# Optional audio assets live in a folder named "sounds" beside main.py.
-# Missing files are safely ignored, so the game still runs without audio.
-SOUND_DIR = Path(__file__).resolve().parent / "sounds"
-SOUND_FILES = {
-    "music": SOUND_DIR / "background_music.ogg",
-    "collect": SOUND_DIR / "collect.wav",
-    "warning": SOUND_DIR / "warning.wav",
-    "victory": SOUND_DIR / "victory.wav",
-    "defeat": SOUND_DIR / "defeat.wav",
-}
-AUDIO_AVAILABLE = False
 SOUND_ENABLED = True
+AUDIO_AVAILABLE = False
+PROJECT_DIR = Path(__file__).resolve().parent
+SOUND_DIR = PROJECT_DIR / "sounds"
+SOUND_NAMES = {
+    "collect": "collect.wav",
+    "warning": "warning.wav",
+    "victory": "victory.wav",
+    "defeat": "defeat.wav",
+    "music": "background_music.ogg",
+}
+
+
+def resolve_sound_path(filename):
+    for directory in (SOUND_DIR, PROJECT_DIR):
+        path = directory / filename
+        if path.is_file():
+            return path
+    return SOUND_DIR / filename
+
+
+SOUND_FILES = {name: resolve_sound_path(filename) for name, filename in SOUND_NAMES.items()}
 sounds = {}
+MUSIC_LOADED = False
+MUSIC_PAUSED = False
+music_sound = None
+music_channel = None
+
+
+def make_tone(frequencies, duration, volume, sample_rate, channel_count, release=0.08):
+    frame_count = int(sample_rate * duration)
+    samples = array("h")
+    for frame in range(frame_count):
+        elapsed = frame / sample_rate
+        envelope = min(1.0, elapsed / 0.015)
+        if release:
+            envelope *= min(1.0, (frame_count - frame) / (sample_rate * release))
+        tone = sum(math.sin(2 * math.pi * frequency * elapsed)
+                   for frequency in frequencies) / len(frequencies)
+        sample = int(32767 * volume * envelope * tone)
+        samples.extend([sample] * channel_count)
+    return pygame.mixer.Sound(buffer=samples.tobytes())
+
+
+def make_fallback_effect(name, sample_rate, channel_count):
+    tones = {
+        "collect": ((880, 1175), 0.20, 0.38),
+        "warning": ((330, 294), 0.48, 0.30),
+        "victory": ((523, 659, 784, 1047), 0.75, 0.30),
+        "defeat": ((392, 330, 262), 0.70, 0.32),
+    }
+    frequencies, duration, volume = tones[name]
+    return make_tone(frequencies, duration, volume, sample_rate, channel_count)
+
 try:
-    pygame.mixer.init()
+    pygame.mixer.init(frequency=44100, size=-16, channels=2)
     AUDIO_AVAILABLE = True
-    for sound_name in ("collect", "warning", "victory", "defeat"):
-        sound_path = SOUND_FILES[sound_name]
-        if sound_path.exists():
-            try:
-                sounds[sound_name] = pygame.mixer.Sound(str(sound_path))
-            except pygame.error:
-                pass
-    if SOUND_FILES["music"].exists():
-        try:
-            pygame.mixer.music.load(str(SOUND_FILES["music"]))
-            pygame.mixer.music.set_volume(0.35)
-            pygame.mixer.music.play(-1)
-        except pygame.error:
-            pass
 except pygame.error:
-    AUDIO_AVAILABLE = False
+    pass
+
+if AUDIO_AVAILABLE:
+    sample_rate, _, channel_count = pygame.mixer.get_init()
+    for sound_name in ("collect", "warning", "victory", "defeat"):
+        sound_file = SOUND_FILES[sound_name]
+        if sound_file.is_file():
+            try:
+                sounds[sound_name] = pygame.mixer.Sound(str(sound_file))
+            except pygame.error:
+                sounds[sound_name] = make_fallback_effect(
+                    sound_name, sample_rate, channel_count
+                )
+        else:
+            sounds[sound_name] = make_fallback_effect(
+                sound_name, sample_rate, channel_count
+            )
+    music_path = SOUND_FILES["music"]
+    if music_path.is_file():
+        try:
+            pygame.mixer.music.load(str(music_path))
+            pygame.mixer.music.set_volume(0.35)
+            MUSIC_LOADED = True
+            if SOUND_ENABLED:
+                pygame.mixer.music.play(-1)
+        except pygame.error:
+            music_path = None
+    else:
+        music_path = None
+    if music_path is None:
+        music_sound = make_tone(
+            (110, 165, 220, 330), 4.0, 0.10,
+            sample_rate, channel_count, release=0,
+        )
+        music_channel = music_sound.play(-1) if SOUND_ENABLED else None
+        if music_channel is not None:
+            music_channel.set_volume(0.45)
+        MUSIC_LOADED = True
 
 
 def play_sound(name):
@@ -52,16 +116,30 @@ def play_sound(name):
 
 
 def set_sound_enabled(enabled):
-    global SOUND_ENABLED
-    SOUND_ENABLED = enabled
-    if not AUDIO_AVAILABLE:
+    global SOUND_ENABLED, MUSIC_PAUSED, music_channel
+    SOUND_ENABLED = bool(enabled)
+    if not AUDIO_AVAILABLE or not MUSIC_LOADED:
         return
     try:
         if SOUND_ENABLED:
-            if SOUND_FILES["music"].exists() and not pygame.mixer.music.get_busy():
+            if MUSIC_PAUSED:
+                if music_channel is not None:
+                    music_channel.unpause()
+                else:
+                    pygame.mixer.music.unpause()
+                MUSIC_PAUSED = False
+            elif music_channel is not None:
+                if not music_channel.get_busy() and music_sound is not None:
+                    music_channel = music_sound.play(-1)
+                    music_channel.set_volume(0.45)
+            elif not pygame.mixer.music.get_busy():
                 pygame.mixer.music.play(-1)
         else:
-            pygame.mixer.music.pause()
+            if music_channel is not None:
+                music_channel.pause()
+            else:
+                pygame.mixer.music.pause()
+            MUSIC_PAUSED = True
     except pygame.error:
         pass
 
@@ -298,7 +376,6 @@ def draw_bar(x, y, width, height, value, max_value, color):
         pygame.draw.rect(screen, color, (x, y, fill_width, height), border_radius=4)
     pygame.draw.rect(screen, WHITE, (x, y, width, height), 1, border_radius=4)
 
-
 def draw():
     elapsed = pygame.time.get_ticks() / 1000.0 - game_start_time
     radius = safe_zone_radius(elapsed)
@@ -492,3 +569,4 @@ if AUDIO_AVAILABLE:
     except pygame.error:
         pass
 pygame.quit()
+
